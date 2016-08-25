@@ -23,16 +23,22 @@ Note that this server is completely insecure, never use it in production environ
 ## ToDo
 
 - [ ] Better CSS
-- [ ] Column names
+- [ ] Display "Wait state" while loading result. In far future: query tracing
+- [x] Column names
+- [ ] Explain
 - [ ] SQL highlighting
 - [ ] Query History
 - [ ] Pagination
 - [ ] Data ordering
 - [ ] Some specific SQL generation (for full text search, database structure, recursive trees etc)
 - [ ] Graphical result representation
-- [ ] Pretty formatting of results of specific types
+- [ ] Pretty formatting of results of specific types (done for "numeric")
 - [ ] Highliting in text search results
 - [ ] Ability to save or link queries
+- [ ] Work with queries longer than HTTP timeout
+- [ ] Displaying result of non-select statements
+- [ ] Ctrl+Enter in textarea
+
 
 
 

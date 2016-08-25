@@ -102,7 +102,26 @@ my $s = AnyEvent::HTTP::Server->new(
 		on_result  => sub {    
 			my ($pg, $conn, $res) = @_; 
 			if($res->status eq 'PGRES_TUPLES_OK') {
-				$cb->({result=>[ $res->rows ]});
+				my $i = 0;
+				my %ftype_oids;
+				my @col_types = map { my $type = $res->ftype($i++); $ftype_oids{$type} = 1; $type;    } $res->columnNames;
+				my $result = {result=>[ $res->rows ], 
+					columns      => [ $res->columnNames ],
+				};
+				$dbp->push_query(
+					query => ['select oid,typname from pg_type where oid IN ('.join(',', 0, keys %ftype_oids).')' ],
+					on_error => sub  { 
+			    		$cb->({error=>$@ });
+        			},  
+					on_result => sub { 
+						my ($pg, $conn, $res) = @_;
+						my %type_by_oid = map { $_->[0]=>$_->[1] } $res->rows;
+						
+						$result->{column_types} = [ map { $type_by_oid{ $_ } } @col_types ];
+
+						$cb->($result);
+					}
+				);
 			} else { 
 				$cb->({error=> $res->errorMessage});	
 			}
@@ -120,13 +139,16 @@ my $s = AnyEvent::HTTP::Server->new(
 	my $html = <<'EOT';
 <html><title>SQL console</title>
 <style>
-	table td { border:1px solid #444444; padding 4px 2px; } 
+	table td { border:1px solid #444444; padding: 4px 4px; } 
 	table { border-collapse: collapse; } 
+	thead tr.names { background-color: #eeeeee;  font-weight: bold; text-align: center;}
+	thead tr.types { background-color: #e7e7e7; text-align: center; }
+	td.type_numeric { text-align: right; }
 </style>
 <script type="text/javascript" src="/js"></script>
 <textarea style="width:100%"></textarea>
 <button style="width:100%">RUN</button>
-<table id="results"><thead></thead><tbody></tbody></table>
+<table id="results"><thead><tr class="names"></tr><tr class="types"></tr></thead><tbody></tbody></table>
 EOT
 	$cb-> (200, $html, {'Content-type'=>'text/html; charset=utf-8'});
  }
@@ -143,17 +165,38 @@ var JSON;JSON||(JSON={}),function(){function f(a){return a<10?"0"+a:a}function q
 function hescape(x) { 
 	return x ? x.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;') : '';
 }
+var formatters  = {
+	numeric: function(x) { 
+		if(!x) return '';
+		var parts = x.split(/\./);
+		parts[0] = parts[0].replace(/(\d)(\d\d\d)$/,'$1&nbsp;$2');
+		for(var i=0;i<parts[0].length/3+1;i++) {
+			parts[0] = parts[0].replace(/(\d)(\d\d\d&nbsp;)/,'$1&nbsp;$2');
+		}
+		return parts[0] + (parts[1] ? '.' + parts[1] : '');
+	}
+};
 $(function() {
- var th = $('table thead');
+ var tn = $('table thead tr.names');
+ var tt = $('table thead tr.types');
  var tb = $('table tbody');
  $('button').on('click', function() { 
 	$.ajax({url:'/api/sql', data: JSON.stringify({sql:$('textarea').val() }), type: 'POST', contentType: 'text/json', success:function(r) { 
 		if(r.error) { alert(r.error); return }
-		var keys = r.result[0];
+		tn.html(''); tt.html('');
 		tb.html('');
+		var types = [];
+		for(var i=0,l=r.columns.length;i<l;i++) { 
+			$('<td/>').appendTo(tn).html(hescape(r.columns[i]));
+			$('<td/>').appendTo(tt).html(hescape(types[i] = r.column_types[i]));
+		}
 		for(var i=0,l=r.result.length;i<l;i++) { 
 			var tr = $('<tr/>').appendTo(tb);
-			for(var k in keys) { $('<td/>').html(hescape(r.result[i][k])).appendTo(tr); }
+			for(var k=0,ll=r.result[i].length;k<ll;k++) { 
+				var val   = r.result[i][k];
+				var type  = types[k];
+ 				var formatter = formatters[type];
+				$('<td/>').addClass('type_' + types[k]).html( formatter ? formatter(val) : hescape(val)).appendTo(tr); }
 		}
 	}});
  });
