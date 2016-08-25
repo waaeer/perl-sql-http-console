@@ -11,7 +11,7 @@ Please install them from github and CPAN respectively.
 
 Run the server:
 ```bash
- perl sql_httpd.pl [ --dbport=5930 ] [ --dbuser=postgres ] [ --port=8019 ] --dbname=ngts2 
+ perl sql_httpd.pl [ --dbport=5930 ] [ --dbuser=postgres ] [ --port=8019 ] --dbname=postgres 
 ```
 
 Point your browser to http://localhost:8019/
