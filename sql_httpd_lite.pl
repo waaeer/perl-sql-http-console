@@ -1,12 +1,11 @@
 #!/usr/bin/perl
 
 use strict;
-use AnyEvent::HTTP::Server;
-use AnyEvent::Pg::Pool;
+use Socket;
+use DBI;
 use Getopt::Long;
-use Hash::Merge;
-use Pod::Usage;
-
+use Data::Dumper;
+use JSON::XS;
 
 GetOptions (
 	 "dbname=s"   => \my $dbname, 
@@ -16,126 +15,122 @@ GetOptions (
      "port=s"     => \my $port,     ## port
 
 );
-$port   ||= 8019;
+$port   ||= 8020;
 $dbport ||= 5432;
 $dbuser ||= 'postgres';
 
 if($help || ! $dbname || ! $dbport || ! $dbuser || !$port) { pod2usage(); }
 
-my $dbp = AnyEvent::Pg::Pool->new({
-      dbname          => $dbname, 
-      user            => $dbuser, 
-      port            => $dbport,
-      connect_timeout => 2,
-  },
-  size             => 10,
-  connection_delay => 2,  
-  on_connect_error => sub { die "Connection error ", @_; } ,
-);
 
-my $s = AnyEvent::HTTP::Server->new(
-	host => '0.0.0.0',
-	port => $port,
-	cb => sub {
-		my $request = shift;
-		my %h = (headers=>{connection=>'close'});
-		if ($request->[1] =~ m|^/api/([-\w]+)|) { 
-			my $method = $1;
-			my $args = '';
-			return sub {  # on body loaded:
-				my ($final, $bodyref) = @_;
-				$args.=$$bodyref;
-				if(!$final) { 
-					return;
-				}
-				eval {
-					$args &&= JSON::XS::decode_json($args);
-					$args ||= {};
-					my $func = API->can("api_$method");
-					if($func) { 
-						$func->($args, sub { 
-							my $ret = shift;
-							$request->replyjs(200, $ret, %h );
-						});
-					} else { 
-						warn "Unknown method $method";
-						$request->replyjs(404, {error=>"Unknown method $method"}, %h);
-					}
-				};
-				if(my $err = $@) {
-					warn "Error occured :", Data::Dumper::Dumper($method, $args, $err);
-					$request->replyjs(500, {error=>'Error occured', detail=>$err }, %h);
-				} 
-			};
-		} else { 
-			my $uri = $request->[1]; 
-			my $page = $uri;
-			$page =~ s|^/+||gs;
-			$page =~ s|[\./]|_|sg;
-			$page ||= 'main';
-			if (my $func = API->can("page_$page")) { 
-				eval { 
-					$func->($request, sub {
-						my ($code, $data, $opt) = @_;
-						$request->reply($code, $data, %{ Hash::Merge::merge({headers=>$opt}, \%h )} );
+my $proto   = getprotobyname("tcp");
+socket    (Server, PF_INET, SOCK_STREAM, $proto)           || die "socket: $!";
+setsockopt(Server, SOL_SOCKET, SO_REUSEADDR, pack("l", 1)) || die "setsockopt: $!";
+bind      (Server, sockaddr_in($port, INADDR_ANY))         || die "bind: $!";
+listen    (Server, SOMAXCONN)                              || die "listen: $!";
 
-					});
-				};
-				if(my $err = $@) {
-					warn "Error occured in page :", Data::Dumper::Dumper($page, $err);
-					$request->reply(500, 'Error occured');
-				} 
-			} else { 
-				warn "Invalid URL ($page) $request->[1]";
-			  	$request->replyjs(404, {error=>'Invalid url'});
-			}
+my $DBH = DBI->connect(qq!dbi:Pg:dbname=$dbname;port=$dbport!, $dbuser, undef, { AutoCommit=>1, RaiseError=>1 } );
+
+for ( ; my $paddr = accept(Client, Server); close Client) {
+
+	my $req = <Client>;
+	if($req =~ m|^GET\s+(\S+)|) { 
+		my $uri  = $1;
+		$uri =~ s|^/||;
+		$uri ||= 'main';
+
+		while(<Client>) {
+			chomp;
+			s/\r//;
+			last unless /\S/; 
 		}
+
+		if(my $func = API->can('page_'.$uri)) { 	
+			$func->(undef, sub { 
+				my ($code, $content, $type) = @_;
+				$type ||= 'text/html';
+				print Client "HTTP/1.1 $code\nServer: sql_httpd_lite\nContent-type: $type\nConnection: close\nContent-Length: ".length($content)."\n\n".$content;
+				close Client;
+			});
+			close Client; # на всякий
+		} else { 
+			print Client "HTTP/1.1 404 Not found\n\n";
+			close Client;			
+		}
+	} elsif ($req =~ m|^POST\s+/api/(\S+)|) {
+		my $uri = $1;
+		my $len = 0;
+		while(<Client>) {
+			chomp;
+			if(/^Content-length: (\d+)/i) { 
+				$len = $1;
+			}
+			s/\r//;
+			last unless /\S/; 
+		}
+		my $content='';
+		my $args;
+		if($len) { 
+			if(!defined read (Client, $content, $len)) {  
+				print Client "HTTP/1.1 500 Read error\n\n";
+				close Client;
+			}
+			eval { 
+				$args = JSON::XS::decode_json($content);
+			};
+			if($@) { 
+				print Client "HTTP/1.1 500 Error\n\n";
+				close Client;
+			}
+		}			
+		if(my $func = API->can('api_'.$uri)) { 			
+			$func->($args, sub { 
+				my ($content, $type) = @_;
+				$content = JSON::XS::encode_json($content);
+				print Client "HTTP/1.1 200\nServer: sql_httpd_lite\nContent-type: text/json\nConnection: close\nContent-Length: ".length($content)."\n\n".$content;
+				close Client;
+			});
+			close Client; # на всякий
+		} else { 
+			print Client "HTTP/1.1 404 Not found\n\n";
+			close Client;			
+		}	
+
+
+	} else { 
+		print Client "HTTP/1.1 400 Unsuported reqeuest\n\n";
+		close Client;			
 	}
-);
+}
+exit(0);
+
 
 { 
  package API;
  sub api_sql { 
 	my ($args, $cb) = @_;
-	$dbp->push_query(
-       	query      => $args->{sql},
-		on_result  => sub {    
-			my ($pg, $conn, $res) = @_; 
-			if($res->status eq 'PGRES_TUPLES_OK') {
-				my $i = 0;
-				my %ftype_oids;
-				my @col_types = map { my $type = $res->ftype($i++); $ftype_oids{$type} = 1; $type;    } $res->columnNames;
-				my $result = {result=>[ $res->rows ], 
-					columns      => [ $res->columnNames ],
-				};
-warn "K=", Data::Dumper::Dumper(%ftype_oids);
-				$dbp->push_query(
-					query => ['select oid,typname from pg_type where oid IN ('.join(',', 0, keys %ftype_oids).')' ],
-					on_error => sub  { 
-			    		$cb->({error=>$@ });
-        			},  
-					on_result => sub { 
-						my ($pg, $conn, $res) = @_;
-						my %type_by_oid = map { $_->[0]=>$_->[1] } $res->rows;
-						
-						$result->{column_types} = [ map { $type_by_oid{ $_ } || $_ } @col_types ];
-
-						$cb->($result);
-					}
-				);
-			} else { 
-				$cb->({error=> $res->errorMessage});	
-			}
-		},
-		on_error => sub { 
-    		warn "error ".Data::Dumper::Dumper([@_]) ; 
-			$cb->({error=>$@ });
-
-        } 
-     );      
+	eval { 
+		my $sth = $DBH->prepare($args->{sql});
+		$sth->execute;
+		my $rows = $sth->fetchall_arrayref;
+		my $names = $sth->{NAME};
+		my $types = $sth->{TYPE};
+#		my %typenames = map { $_->[0] => $_->[1] } 
+#			@{$DBH->selectall_arrayref('select oid,typname from pg_type where oid IN ('.join(',', 0, @$types).')' )};
+#warn Data::Dumper::Dumper( $types);
+		$cb->({
+			result       => $rows,
+			columns      => $names,
+#			column_types => [map { $typenames{$_} || $_  } @$types], 
+			column_types => [map { my $t = $DBH->type_info($_); $t ? $t ->{TYPE_NAME} : '?' } @$types ],
+		});
+	};
+	if($@) {
+		$cb->({ error=> $@ });
+	}
+	
 	return undef;
  }
- sub page_main { 
+  sub page_main { 
 	my ($req, $cb) = @_;
 	my $html = <<'EOT';
 <html><title>SQL console</title>
@@ -151,7 +146,7 @@ warn "K=", Data::Dumper::Dumper(%ftype_oids);
 <button style="width:100%">RUN</button>
 <table id="results"><thead><tr class="names"></tr><tr class="types"></tr></thead><tbody></tbody></table>
 EOT
-	$cb-> (200, $html, {'Content-type'=>'text/html; charset=utf-8'});
+	$cb-> (200, $html, 'text/html; charset=utf-8');
  }
  sub page_js { 
 	my ($req, $cb) = @_;
@@ -164,7 +159,8 @@ EOT
 var JSON;JSON||(JSON={}),function(){function f(a){return a<10?"0"+a:a}function quote(a){return escapable.lastIndex=0,escapable.test(a)?'"'+a.replace(escapable,function(a){var b=meta[a];return typeof b=="string"?b:"\\u"+("0000"+a.charCodeAt(0).toString(16)).slice(-4)})+'"':'"'+a+'"'}function str(a,b){var c,d,e,f,g=gap,h,i=b[a];i&&typeof i=="object"&&typeof i.toJSON=="function"&&(i=i.toJSON(a)),typeof rep=="function"&&(i=rep.call(b,a,i));switch(typeof i){case"string":return quote(i);case"number":return isFinite(i)?String(i):"null";case"boolean":case"null":return String(i);case"object":if(!i)return"null";gap+=indent,h=[];if(Object.prototype.toString.apply(i)==="[object Array]"){f=i.length;for(c=0;c<f;c+=1)h[c]=str(c,i)||"null";return e=h.length===0?"[]":gap?"[\n"+gap+h.join(",\n"+gap)+"\n"+g+"]":"["+h.join(",")+"]",gap=g,e}if(rep&&typeof rep=="object"){f=rep.length;for(c=0;c<f;c+=1)typeof rep[c]=="string"&&(d=rep[c],e=str(d,i),e&&h.push(quote(d)+(gap?": ":":")+e))}else for(d in i)Object.prototype.hasOwnProperty.call(i,d)&&(e=str(d,i),e&&h.push(quote(d)+(gap?": ":":")+e));return e=h.length===0?"{}":gap?"{\n"+gap+h.join(",\n"+gap)+"\n"+g+"}":"{"+h.join(",")+"}",gap=g,e}}"use strict",typeof Date.prototype.toJSON!="function"&&(Date.prototype.toJSON=function(a){return isFinite(this.valueOf())?this.getUTCFullYear()+"-"+f(this.getUTCMonth()+1)+"-"+f(this.getUTCDate())+"T"+f(this.getUTCHours())+":"+f(this.getUTCMinutes())+":"+f(this.getUTCSeconds())+"Z":null},String.prototype.toJSON=Number.prototype.toJSON=Boolean.prototype.toJSON=function(a){return this.valueOf()});var cx=/[\u0000\u00ad\u0600-\u0604\u070f\u17b4\u17b5\u200c-\u200f\u2028-\u202f\u2060-\u206f\ufeff\ufff0-\uffff]/g,escapable=/[\\\"\x00-\x1f\x7f-\x9f\u00ad\u0600-\u0604\u070f\u17b4\u17b5\u200c-\u200f\u2028-\u202f\u2060-\u206f\ufeff\ufff0-\uffff]/g,gap,indent,meta={"\b":"\\b","\t":"\\t","\n":"\\n","\f":"\\f","\r":"\\r",'"':'\\"',"\\":"\\\\"},rep;typeof JSON.stringify!="function"&&(JSON.stringify=function(a,b,c){var d;gap="",indent="";if(typeof c=="number")for(d=0;d<c;d+=1)indent+=" ";else typeof c=="string"&&(indent=c);rep=b;if(!b||typeof b=="function"||typeof b=="object"&&typeof b.length=="number")return str("",{"":a});throw new Error("JSON.stringify")}),typeof JSON.parse!="function"&&(JSON.parse=function(text,reviver){function walk(a,b){var c,d,e=a[b];if(e&&typeof e=="object")for(c in e)Object.prototype.hasOwnProperty.call(e,c)&&(d=walk(e,c),d!==undefined?e[c]=d:delete e[c]);return reviver.call(a,b,e)}var j;text=String(text),cx.lastIndex=0,cx.test(text)&&(text=text.replace(cx,function(a){return"\\u"+("0000"+a.charCodeAt(0).toString(16)).slice(-4)}));if(/^[\],:{}\s]*$/.test(text.replace(/\\(?:["\\\/bfnrt]|u[0-9a-fA-F]{4})/g,"@").replace(/"[^"\\\n\r]*"|true|false|null|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?/g,"]").replace(/(?:^|:|,)(?:\s*\[)+/g,"")))return j=eval("("+text+")"),typeof reviver=="function"?walk({"":j},""):j;throw new SyntaxError("JSON.parse")})}()
 
 function hescape(x) { 
-	return x ? x.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;') : '';
+	if(x===null)  return '';
+	return x.replace ? x.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;') : x ;
 }
 var formatters  = {
 	numeric: function(x) { 
@@ -203,25 +199,20 @@ $(function() {
  });
 });
 EOT
-	$cb-> (200, $html, {'Content-type'=>'text/javascript; charset=utf-8'});
+	$cb-> (200, $html, 'text/javascript');
  }
+
 }
-
-$s->listen;
-$s->accept;
-EV::loop();
-exit(0);
-
 
 =pod
 
 =head1 DESCRIPTION
 
-sql_httpd.pl -- Simple Perl HTTP PostgreSQL console
+sql_httpd_lite.pl -- Simple Perl HTTP PostgreSQL console
 
 =head1 USAGE
 
-sql_httpd.pl --port=8019 --dbname=... --dbport=5432  --dbuser=postgres
+sql_httpd_lite.pl --port=8019 --dbname=... --dbport=5432  --dbuser=postgres
 
 
 =cut
